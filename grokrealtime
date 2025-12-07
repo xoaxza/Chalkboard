@@ -1,0 +1,94 @@
+import os
+import json
+import asyncio
+import websockets
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from dotenv import load_dotenv
+
+load_dotenv()
+
+app = FastAPI()
+
+XAI_API_KEY = os.getenv("XAI_API_KEY")
+XAI_URL = "wss://api.x.ai/v1/realtime"
+
+SYSTEM_PROMPT = "You are an interactive Math Tutor. You have a digital whiteboard. Help the student step-by-step. When you explain a step, use the 'update_board' tool to write it out."
+
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "update_board",
+            "description": "Write a step on the digital whiteboard with a latex equation and an explanation.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "latex": {"type": "string", "description": "The math equation in LaTeX format."},
+                    "explanation": {"type": "string", "description": "A brief explanation of the step."}
+                },
+                "required": ["latex", "explanation"]
+            }
+        }
+    }
+]
+
+@app.websocket("/ws")
+async def websocket_endpoint(client_ws: WebSocket):
+    await client_ws.accept()
+    
+    if not XAI_API_KEY:
+        print("Error: XAI_API_KEY not found in environment variables.")
+        await client_ws.close(code=1008)
+        return
+
+    headers = {
+        "Authorization": f"Bearer {XAI_API_KEY}"
+    }
+
+    try:
+        async with websockets.connect(XAI_URL, extra_headers=headers) as xai_ws:
+            # Session Config
+            session_config = {
+                "type": "session.update",
+                "session": {
+                    "instructions": SYSTEM_PROMPT,
+                    "tools": TOOLS
+                }
+            }
+            await xai_ws.send(json.dumps(session_config))
+
+            async def client_to_xai():
+                try:
+                    while True:
+                        data = await client_ws.receive_text()
+                        # Forward exactly as received
+                        await xai_ws.send(data)
+                except WebSocketDisconnect:
+                    print("Client disconnected")
+                except Exception as e:
+                    print(f"Error forwarding client -> xAI: {e}")
+
+            async def xai_to_client():
+                try:
+                    async for message in xai_ws:
+                        # Forward exactly as received
+                        await client_ws.send_text(message)
+                except Exception as e:
+                    print(f"Error forwarding xAI -> client: {e}")
+
+            # Run both tasks until one fails or completes
+            # return_when=asyncio.FIRST_COMPLETED ensures that if one side disconnects, we stop the other
+            done, pending = await asyncio.wait(
+                [asyncio.create_task(client_to_xai()), asyncio.create_task(xai_to_client())],
+                return_when=asyncio.FIRST_COMPLETED
+            )
+            
+            for task in pending:
+                task.cancel()
+
+    except Exception as e:
+        print(f"Connection error: {e}")
+        try:
+            await client_ws.close()
+        except:
+            pass
